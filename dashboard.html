@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AR 伺服器端：1m 陣列地圖、後台軌跡虛線範圍與實心建築監控</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  body { margin: 0; background: #08090c; color: #eee; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; display: flex; height: 100vh; overflow: hidden; }
+  #sidebar { width: 340px; background: #111319; border-right: 1px solid #232733; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+  h2 { font-size: 13px; margin: 4px 0 6px; color: #6effe1; letter-spacing: 0.08em; text-transform: uppercase; }
+  .room-bar { display: flex; gap: 6px; }
+  .room-bar input { flex: 1; background: #08090c; border: 1px solid #2a2e39; color: #fff; padding: 8px 10px; border-radius: 6px; font-family: inherit; }
+  .room-bar button { background: #6effe1; color: #000; border: 0; padding: 8px 14px; border-radius: 6px; font-weight: bold; cursor: pointer; }
+  .card { background: #191d26; border: 1px solid #262b38; padding: 10px 12px; border-radius: 8px; margin-bottom: 8px; font-size: 12px; line-height: 1.65; }
+  .active-tag { color: #6effe1; font-weight: bold; }
+  .inactive-tag { color: #777; }
+  #status { font-size: 12px; color: #ffb86c; line-height: 1.4; }
+  #map { flex: 1; display: block; cursor: grab; }
+  #map:active { cursor: grabbing; }
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <div>
+    <h2>連機頻道設定 (Room Sync)</h2>
+    <div class="room-bar">
+      <input id="roomInput" type="text" value="AR-ROOM-1" placeholder="輸入房號">
+      <button id="btnConnect">同步</button>
+    </div>
+    <div id="status" style="margin-top:6px;">狀態：初始化連線中...</div>
+  </div>
+  <div>
+    <h2>線上玩家與軌跡範圍 (Players &amp; Hull)</h2>
+    <div id="playerList">等待玩家連入...</div>
+  </div>
+  <div>
+    <h2>1m 陣列標記與實心建築狀態</h2>
+    <div id="markerList">載入 1m 陣列中...</div>
+  </div>
+</div>
+<canvas id="map"></canvas>
+
+<script>
+const cv = document.getElementById('map');
+const ctx = cv.getContext('2d');
+const statusEl = document.getElementById('status');
+
+const GRID_STEP = 1.0;
+const GRID_HALF = 12;
+
+function rowLabel(idx) {
+  let s = '';
+  let n = idx;
+  while (n >= 0) {
+    s = String.fromCharCode(65 + (n % 26)) + s;
+    n = Math.floor(n / 26) - 1;
+  }
+  return s;
+}
+
+function createDefaultGrid() {
+  const m = {};
+  for (let r = -GRID_HALF; r <= GRID_HALF; r++) {
+    const rStr = rowLabel(r + GRID_HALF);
+    for (let c = -GRID_HALF; c <= GRID_HALF; c++) {
+      const colNum = c + GRID_HALF + 1;
+      const id = `${rStr}-${colNum}`;
+      const gx = +(c * GRID_STEP).toFixed(2), gz = +(r * GRID_STEP).toFixed(2);
+      m[id] = { id, gx, gz, x: gx, z: gz, active: false };
+    }
+  }
+  return m;
+}
+
+let players = {};
+let displayPlayers = {};
+let traces = {};      // 後台儲存的空間軌跡點 id -> [{x, z}, ...]
+let structures = [];  // 實心不透明虛擬建築
+let markers = createDefaultGrid();
+let walls = [];
+let peer = null, ws = null, reconnectTimer = null;
+
+// 畫布平移與縮放 (1公尺 = 36px)
+let zoom = 36;
+let panX = 0, panY = 0, dragging = false, lastMouse = { x: 0, y: 0 };
+
+function resize() { cv.width = cv.clientWidth; cv.height = cv.clientHeight; }
+window.addEventListener('resize', resize);
+resize();
+
+cv.addEventListener('pointerdown', (e) => { dragging = true; lastMouse = { x: e.clientX, y: e.clientY }; });
+window.addEventListener('pointerup', () => { dragging = false; });
+window.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  panX += e.clientX - lastMouse.x;
+  panY += e.clientY - lastMouse.y;
+  lastMouse = { x: e.clientX, y: e.clientY };
+});
+cv.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  zoom = Math.max(12, Math.min(90, zoom * (e.deltaY < 0 ? 1.1 : 0.9)));
+}, { passive: false });
+
+function recordBgTrace(pid, x, z) {
+  if (!traces[pid]) traces[pid] = [];
+  const list = traces[pid];
+  const last = list[list.length - 1];
+  if (!last || Math.hypot(x - last.x, z - last.z) >= 0.25) {
+    list.push({ x: +Number(x).toFixed(2), z: +Number(z).toFixed(2) });
+  }
+}
+
+function handleMsg(msg) {
+  if (!msg || !msg.type) return;
+  if (msg.type === 'init' || msg.type === 'stateSnapshot') {
+    players = msg.players || {};
+    if (msg.traces) traces = Object.assign({}, traces, msg.traces);
+    if (Array.isArray(msg.structures)) structures = msg.structures;
+    if (msg.markers) {
+      for (const id in msg.markers) markers[id] = msg.markers[id];
+    }
+    if (Array.isArray(msg.walls)) walls = msg.walls;
+  } else if (msg.type === 'playerJoined' || msg.type === 'playerMove') {
+    if (msg.player && msg.player.id) {
+      players[msg.player.id] = msg.player;
+      recordBgTrace(msg.player.id, msg.player.x, msg.player.z);
+    }
+    if (msg.traces) traces = Object.assign({}, traces, msg.traces);
+  } else if (msg.type === 'structuresUpdated') {
+    if (Array.isArray(msg.structures)) structures = msg.structures;
+  } else if (msg.type === 'playerLeft') {
+    delete players[msg.id];
+    delete displayPlayers[msg.id];
+  } else if (msg.type === 'markerUpdated' || msg.type === 'markerActivated') {
+    if (msg.marker) markers[msg.marker.id] = msg.marker;
+    if (msg.walls) walls = msg.walls;
+  }
+  updateSidebar();
+}
+
+function connectRoom() {
+  const room = document.getElementById('roomInput').value.trim() || 'AR-ROOM-1';
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  if (peer) { try { peer.destroy(); } catch (e) {} peer = null; }
+
+  if (!location.hostname.endsWith('github.io')) {
+    try {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}`);
+      ws.onopen = () => {
+        statusEl.textContent = '狀態：已連接 Node.js 伺服器（即時同步中）';
+        statusEl.style.color = '#6effe1';
+        ws.send(JSON.stringify({ type: 'registerRole', role: 'dashboard' }));
+      };
+      ws.onmessage = (ev) => handleMsg(JSON.parse(ev.data));
+      ws.onerror = () => connectPeerJS(room);
+      ws.onclose = () => {
+        reconnectTimer = setTimeout(connectRoom, 2500);
+      };
+      return;
+    } catch (e) {}
+  }
+  connectPeerJS(room);
+}
+
+function connectPeerJS(room) {
+  statusEl.textContent = `狀態：正在監聽雲端房間 [${room}]...`;
+  statusEl.style.color = '#ffb86c';
+  const cleanRoom = room.replace(/[^a-zA-Z0-9_-]/g, '');
+  const hostId = `ar-vision-v5-${cleanRoom}-host`;
+
+  peer = new Peer();
+  peer.on('open', (myId) => {
+    const conn = peer.connect(hostId, { reliable: true });
+    conn.on('open', () => {
+      statusEl.textContent = `狀態：已連入雲端房間 [${room}]（即時同步中）`;
+      statusEl.style.color = '#6effe1';
+      conn.send({ type: 'registerRole', role: 'dashboard', id: myId });
+    });
+    conn.on('data', (data) => handleMsg(data));
+    conn.on('close', () => {
+      statusEl.textContent = `狀態：等待手機端開啟房間 [${room}]（自動重連中...）`;
+      statusEl.style.color = '#ffb86c';
+      reconnectTimer = setTimeout(connectRoom, 2500);
+    });
+    conn.on('error', () => {
+      reconnectTimer = setTimeout(connectRoom, 2500);
+    });
+  });
+  peer.on('error', () => {
+    statusEl.textContent = `狀態：等待首位玩家進入房間 [${room}]...`;
+    reconnectTimer = setTimeout(connectRoom, 2500);
+  });
+}
+
+document.getElementById('btnConnect').addEventListener('click', connectRoom);
+connectRoom();
+
+function degText(rad) {
+  const d = ((Math.round((Number(rad) || 0) * 180 / Math.PI) % 360) + 360) % 360;
+  return String(d).padStart(3, '0') + '°';
+}
+
+function updateSidebar() {
+  const pEl = document.getElementById('playerList');
+  const pArr = Object.values(players);
+  pEl.innerHTML = pArr.length ? pArr.map(p => {
+    const tCount = (traces[p.id] || []).length;
+    return `
+      <div class="card">
+        <b style="color:#ff6a5a;">● 玩家 ID: ${p.id}</b><br>
+        座標: (${Number(p.x || 0).toFixed(2)}m, ${Number(p.z || 0).toFixed(2)}m)<br>
+        朝向: ${degText(p.yaw)} ｜ 速度: ${Number(p.speed || 0).toFixed(2)} m/s<br>
+        <span style="color:#9ab;">後台軌跡取樣點: ${tCount} 點 (已轉為虛線範圍)</span>
+      </div>
+    `;
+  }).join('') : '<div class="card">等待手機端玩家完成拍照並登入空間...</div>';
+
+  const mEl = document.getElementById('markerList');
+  const mArr = Object.values(markers);
+  const activeArr = mArr.filter(m => m.active);
+  const summary = `
+    <div class="card">
+      <b>1m 陣列總數：${mArr.length} 點（間距 1.0m）</b><br>
+      <span class="active-tag">已激活定位：${activeArr.length} 點</span><br>
+      <b>實心生成建築：${structures.length} 座構件</b>
+    </div>
+  `;
+  const listHtml = activeArr.slice(-15).reverse().map(m => `
+    <div class="card">
+      <b>[${m.id}]</b> <span class="active-tag">● 已激活</span> (由 ${m.activatedBy || '玩家'})<br>
+      座標: (${Number(m.x).toFixed(2)}m, ${Number(m.z).toFixed(2)}m)
+    </div>
+  `).join('');
+  mEl.innerHTML = summary + (listHtml || '<div class="card inactive-tag">玩家走近 1m 標記點 (<1.65m) 時將自動激活</div>');
+}
+
+function wrapAngle(a) {
+  while (a > Math.PI) a -= Math.PI * 2;
+  while (a < -Math.PI) a += Math.PI * 2;
+  return a;
+}
+
+// 計算後台軌跡點集合的外包凸包邊界 (Monotone Chain Convex Hull + 外擴緩衝區)，用以虛線勾勒活動範圍
+function computeExpandedHull(pts, padMeters = 0.65) {
+  if (!pts || pts.length === 0) return [];
+  // 對每個軌跡點四周產生 8 角緩衝點，使單點或直線軌跡也能勾勒出完整的空間膠囊/多邊形範圍
+  const expanded = [];
+  for (const p of pts) {
+    for (let a = 0; a < 8; a++) {
+      const ang = (a / 8) * Math.PI * 2;
+      expanded.push({
+        x: p.x + Math.cos(ang) * padMeters,
+        z: p.z + Math.sin(ang) * padMeters,
+      });
+    }
+  }
+  expanded.sort((a, b) => (a.x !== b.x ? a.x - b.x : a.z - b.z));
+  const cross = (o, a, b) => (a.x - o.x) * (b.z - o.z) - (a.z - o.z) * (b.x - o.x);
+  const lower = [];
+  for (const p of expanded) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i = expanded.length - 1; i >= 0; i--) {
+    const p = expanded[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
+    upper.push(p);
+  }
+  upper.pop();
+  lower.pop();
+  return lower.concat(upper);
+}
+
+function render() {
+  requestAnimationFrame(render);
+  const W = cv.width, H = cv.height;
+  const cx = W / 2 + panX, cy = H / 2 + panY;
+
+  ctx.fillStyle = '#08090c';
+  ctx.fillRect(0, 0, W, H);
+
+  // 1. 繪製 1m 標準陣列網格線
+  const step1m = zoom * GRID_STEP;
+  ctx.strokeStyle = 'rgba(110, 255, 225, 0.07)';
+  ctx.lineWidth = 1;
+  for (let x = cx % step1m; x < W; x += step1m) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = cy % step1m; y < H; y += step1m) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  // 2. 根據後台軌跡數據，用虛線將探索範圍勾勒出來（不畫內部雜亂軌跡線）
+  const allTracePts = [];
+  Object.keys(traces).forEach((pid) => {
+    const pts = traces[pid] || [];
+    pts.forEach((pt) => allTracePts.push(pt));
+    if (pts.length >= 1) {
+      const hull = computeExpandedHull(pts, 0.55);
+      if (hull.length >= 3) {
+        ctx.save();
+        ctx.fillStyle = 'rgba(110, 255, 225, 0.05)';
+        ctx.strokeStyle = 'rgba(110, 255, 225, 0.78)';
+        ctx.lineWidth = 1.8;
+        ctx.setLineDash([8, 6]); // 虛線勾勒範圍邊界
+        ctx.beginPath();
+        ctx.moveTo(cx + hull[0].x * zoom, cy + hull[0].z * zoom);
+        for (let i = 1; i < hull.length; i++) {
+          ctx.lineTo(cx + hull[i].x * zoom, cy + hull[i].z * zoom);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+  });
+
+  // 3. 繪製已探索的真實牆體
+  ctx.strokeStyle = 'rgba(110, 255, 225, 0.45)';
+  ctx.lineWidth = 3;
+  walls.forEach(w => {
+    ctx.beginPath();
+    ctx.moveTo(cx + w.x1 * zoom, cy + w.z1 * zoom);
+    ctx.lineTo(cx + w.x2 * zoom, cy + w.z2 * zoom);
+    ctx.stroke();
+  });
+
+  // 4. 繪製 1m 格狀陣列標記物 (A-1, A-2...)
+  Object.values(markers).forEach(m => {
+    const sx = cx + m.x * zoom, sy = cy + m.z * zoom;
+    if (sx < -20 || sx > W + 20 || sy < -20 || sy > H + 20) return;
+
+    if (m.active) {
+      ctx.strokeStyle = '#6effe1';
+      ctx.fillStyle = 'rgba(110,255,225,0.28)';
+      ctx.lineWidth = 1.8;
+      ctx.strokeRect(sx - 5, sy - 5, 10, 10);
+      ctx.fillRect(sx - 5, sy - 5, 10, 10);
+      if (zoom >= 24) {
+        ctx.fillStyle = '#6effe1';
+        ctx.font = 'bold 10px ui-monospace, monospace';
+        ctx.fillText(m.id, sx + 7, sy + 3);
+      }
+    } else {
+      ctx.fillStyle = 'rgba(255,255,255,0.18)';
+      ctx.fillRect(sx - 1.5, sy - 1.5, 3, 3);
+      if (zoom >= 42) {
+        ctx.fillStyle = 'rgba(255,255,255,0.28)';
+        ctx.font = '9px ui-monospace, monospace';
+        ctx.fillText(m.id, sx + 4, sy + 3);
+      }
+    }
+  });
+
+  // 5. 繪製實心不透明虛擬生成建築物 (Solid Opaque Structures)
+  structures.forEach(o => {
+    const sx = cx + o.x * zoom, sy = cy + o.z * zoom;
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(o.rot || 0);
+    const pw = Math.max(4, o.w * zoom), pd = Math.max(4, o.d * zoom);
+    ctx.fillStyle = '#d8dee9'; // 實心不透明量體填色
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(-pw / 2, -pd / 2, pw, pd);
+    ctx.strokeRect(-pw / 2, -pd / 2, pw, pd);
+    ctx.restore();
+  });
+
+  // 6. 平滑插值並繪製所有連機玩家位置與視線方向錐
+  Object.values(players).forEach(p => {
+    if (!displayPlayers[p.id]) {
+      displayPlayers[p.id] = { x: Number(p.x) || 0, z: Number(p.z) || 0, yaw: Number(p.yaw) || 0 };
+    } else {
+      const dp = displayPlayers[p.id];
+      dp.x += ((Number(p.x) || 0) - dp.x) * 0.25;
+      dp.z += ((Number(p.z) || 0) - dp.z) * 0.25;
+      dp.yaw += wrapAngle((Number(p.yaw) || 0) - dp.yaw) * 0.28;
+    }
+    const dp = displayPlayers[p.id];
+    const sx = cx + dp.x * zoom, sy = cy + dp.z * zoom;
+
+    const fovHalf = 28 * Math.PI / 180;
+    const coneLen = 1.8 * zoom;
+    ctx.fillStyle = 'rgba(255, 82, 82, 0.18)';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + Math.sin(dp.yaw - fovHalf) * coneLen, sy - Math.cos(dp.yaw - fovHalf) * coneLen);
+    ctx.lineTo(sx + Math.sin(dp.yaw + fovHalf) * coneLen, sy - Math.cos(dp.yaw + fovHalf) * coneLen);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.strokeStyle = '#ff5252';
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    ctx.moveTo(sx, sy);
+    ctx.lineTo(sx + Math.sin(dp.yaw) * (1.2 * zoom), sy - Math.cos(dp.yaw) * (1.2 * zoom));
+    ctx.stroke();
+
+    ctx.fillStyle = '#ff5252';
+    ctx.beginPath(); ctx.arc(sx, sy, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 12px ui-monospace, monospace';
+    ctx.fillText(`${p.id} (${dp.x.toFixed(1)}, ${dp.z.toFixed(1)})`, sx - 24, sy - 12);
+  });
+}
+render();
+</script>
+</body>
+</html>

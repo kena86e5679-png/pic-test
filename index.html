@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#08090c">
+<title>SPATIAL PERCEPTION AR — 1m 網格空間感知與目標鎖定系統</title>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root {
+    --fg: #f3f5f8;
+    --dim: rgba(243, 245, 248, 0.58);
+    --line: rgba(255, 255, 255, 0.16);
+    --accent: #6effe1;
+    --danger: #ff4d4d;
+    --bg-glass: rgba(12, 14, 18, 0.76);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; height: 100%; background: #08090c; color: var(--fg); overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang TC", "Noto Sans TC", sans-serif;
+    touch-action: none; overscroll-behavior: none; -webkit-user-select: none; user-select: none;
+  }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  #cam { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+
+  /* 底部控制列 */
+  #bar[hidden] { display: none; }
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap;
+    padding: 12px 14px calc(12px + env(safe-area-inset-bottom, 0px)); z-index: 5;
+  }
+  .btn {
+    appearance: none; border: 1px solid var(--line); background: var(--bg-glass); color: var(--fg);
+    font: 500 13px/1 inherit; letter-spacing: 0.03em; padding: 12px 16px; border-radius: 999px;
+    min-height: 42px; backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); cursor: pointer;
+    transition: all 0.18s ease;
+  }
+  .btn:active, .btn.on { background: var(--fg); color: #08090c; border-color: var(--fg); font-weight: 600; }
+
+  /* 建築感啟動與拍攝敵人登錄頁面 */
+  #intro {
+    position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column; justify-content: space-between;
+    padding: calc(20px + env(safe-area-inset-top, 0px)) 20px calc(20px + env(safe-area-inset-bottom, 0px));
+    background:
+      linear-gradient(to right, rgba(255,255,255,0.03) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.03) 1px, transparent 1px),
+      radial-gradient(circle at 50% 15%, rgba(110,255,225,0.09), transparent 60%),
+      #08090c;
+    background-size: 32px 32px, 32px 32px, 100% 100%, 100% 100%;
+    overflow-y: auto; gap: 14px;
+  }
+  .intro-header {
+    max-width: 440px; width: 100%; margin: 0 auto; border-left: 2px solid var(--accent); padding-left: 14px;
+  }
+  .intro-tag {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--accent);
+    letter-spacing: 0.18em; text-transform: uppercase; margin-bottom: 4px;
+  }
+  .intro-header h1 {
+    font-size: 22px; font-weight: 600; letter-spacing: 0.05em; margin: 0; line-height: 1.25;
+  }
+  .intro-sub {
+    font-size: 12.5px; color: var(--dim); margin-top: 4px; line-height: 1.5;
+  }
+
+  /* Login 前敵人樣貌拍攝登錄模組 */
+  .capture-section {
+    max-width: 440px; width: 100%; margin: 0 auto;
+    background: rgba(255, 255, 255, 0.035); border: 1px solid var(--line); border-radius: 14px;
+    padding: 12px 14px; backdrop-filter: blur(8px);
+  }
+  .cap-head {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;
+  }
+  .cap-title {
+    font-size: 13px; font-weight: 600; color: var(--fg); display: flex; align-items: center; gap: 6px;
+  }
+  .cap-badge {
+    font-family: ui-monospace, Menlo, monospace; font-size: 10px; padding: 3px 7px; border-radius: 99px;
+    background: rgba(255, 77, 77, 0.18); color: #ff6a6a; border: 1px solid rgba(255, 77, 77, 0.4);
+  }
+  .cap-badge.ok {
+    background: rgba(110, 255, 225, 0.16); color: var(--accent); border-color: rgba(110, 255, 225, 0.45);
+  }
+  .cap-desc {
+    font-size: 11.5px; color: var(--dim); margin: 0 0 10px; line-height: 1.5;
+  }
+  .cap-viewport {
+    position: relative; width: 100%; height: 170px; background: #050608; border: 1px dashed rgba(255,255,255,0.25);
+    border-radius: 10px; overflow: hidden; display: flex; align-items: center; justify-content: center;
+  }
+  #regCanvas {
+    width: 100%; height: 100%; object-fit: cover; display: block;
+  }
+  .cap-guide {
+    position: absolute; width: 96px; height: 136px; border: 1.5px dashed rgba(255, 77, 77, 0.75);
+    border-radius: 8px; pointer-events: none; display: flex; align-items: flex-end; justify-content: center;
+    padding-bottom: 4px; font-size: 10px; color: rgba(255,255,255,0.75); background: rgba(255, 45, 55, 0.06);
+  }
+  .cap-actions {
+    display: flex; gap: 8px; margin-top: 10px;
+  }
+  .cap-btn {
+    flex: 1; padding: 10px 12px; border-radius: 10px; font-size: 12.5px; font-weight: 600;
+    border: 1px solid var(--line); background: rgba(255,255,255,0.08); color: var(--fg); cursor: pointer;
+  }
+  .cap-btn.primary {
+    background: var(--accent); color: #08090c; border-color: var(--accent);
+  }
+
+  .feature-grid {
+    max-width: 440px; width: 100%; margin: 0 auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .f-card {
+    background: rgba(255, 255, 255, 0.03); border: 1px solid var(--line); border-radius: 10px;
+    padding: 10px 12px;
+  }
+  .f-card .f-num {
+    font-family: ui-monospace, Menlo, monospace; font-size: 10px; color: var(--accent); letter-spacing: 0.08em;
+  }
+  .f-card h3 {
+    font-size: 13px; font-weight: 600; margin: 3px 0 4px;
+  }
+  .f-card p {
+    font-size: 11px; color: var(--dim); margin: 0; line-height: 1.45;
+  }
+
+  .intro-footer {
+    max-width: 440px; width: 100%; margin: 0 auto; display: flex; flex-direction: column; gap: 10px;
+  }
+  .room-panel {
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(255, 255, 255, 0.04); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px;
+  }
+  .room-panel span { font-size: 12px; color: var(--dim); }
+  .room-panel input {
+    background: rgba(0, 0, 0, 0.45); border: 1px solid rgba(255, 255, 255, 0.22); color: #fff;
+    padding: 6px 10px; border-radius: 6px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+    width: 140px; text-align: center; outline: none;
+  }
+  .go-btn {
+    width: 100%; font-size: 15px; font-weight: 600; letter-spacing: 0.08em; padding: 15px;
+    background: var(--fg); color: #08090c; border: 0; border-radius: 12px; cursor: pointer;
+    transition: opacity 0.2s;
+  }
+  .go-btn:disabled {
+    opacity: 0.32; cursor: not-allowed;
+  }
+  .dash-link {
+    text-align: center; color: var(--accent); font-size: 12px; text-decoration: none; opacity: 0.88;
+  }
+  #err { color: #ff8a7a; font-size: 12px; text-align: center; min-height: 1.2em; line-height: 1.4; }
+
+  #panel {
+    max-height: 60vh; overflow: auto; position: fixed; left: 12px; right: 12px;
+    bottom: calc(70px + env(safe-area-inset-bottom, 0px)); z-index: 6;
+    background: rgba(10, 12, 16, 0.88); border: 1px solid var(--line); border-radius: 16px;
+    padding: 16px; display: none; max-width: 440px; margin: 0 auto;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #panel.open { display: block; }
+  #panel label {
+    display: grid; grid-template-columns: 7.5em 1fr 3em; align-items: center; gap: 10px;
+    font-size: 13px; padding: 6px 0; color: var(--dim);
+  }
+  #panel output { text-align: right; color: var(--fg); font-variant-numeric: tabular-nums; }
+  #panel input[type=range] { width: 100%; touch-action: pan-x; }
+  #panel .row { display: flex; gap: 8px; padding-top: 10px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<video id="cam" playsinline muted autoplay></video>
+
+<div id="intro">
+  <div class="intro-header">
+    <div class="intro-tag">SPATIAL PERCEPTION &amp; 1M GRID AR</div>
+    <h1>空間視野 ／ 1m 陣列共構系統</h1>
+    <div class="intro-sub">請先拍攝另一位連機玩家（敵人）的全身或半身樣貌以建立視覺特徵，完成後即可登入空間系統。</div>
+  </div>
+
+  <!-- 登入前必備：拍攝其他玩家(敵人)樣貌 -->
+  <div class="capture-section">
+    <div class="cap-head">
+      <div class="cap-title">STEP 1 · 拍攝其他玩家樣貌（敵人特徵建檔）</div>
+      <span id="capBadge" class="cap-badge">尚未拍攝</span>
+    </div>
+    <p class="cap-desc">請開啟鏡頭對準除了自己以外的連機玩家（敵人），將其置於紅框內並按下「拍攝鎖定目標」，系統將提取其衣著色彩與身形特徵以利後續追蹤偵測。</p>
+    <div class="cap-viewport">
+      <canvas id="regCanvas" width="320" height="180"></canvas>
+      <div id="capGuide" class="cap-guide">對準對手拍攝</div>
+    </div>
+    <div class="cap-actions">
+      <button id="btnInitCam" class="cap-btn">1. 開啟預覽鏡頭</button>
+      <button id="btnSnapEnemy" class="cap-btn primary" disabled>2. 拍攝鎖定目標</button>
+    </div>
+  </div>
+
+  <div class="feature-grid">
+    <div class="f-card">
+      <div class="f-num">01 / 1M GRID</div>
+      <h3>一公尺格狀標記</h3>
+      <p>空間依 1m×1m 高密度陣列配置標記點（A-1, A-2...），走近即可激活並同步座標。</p>
+    </div>
+    <div class="f-card">
+      <div class="f-num">02 / SOLID ARCH</div>
+      <h3>實心不透明建築</h3>
+      <p>生成的建築結構為實心不透明量體，直接遮蔽後方視野與敵人標記。</p>
+    </div>
+    <div class="f-card">
+      <div class="f-num">03 / TRACE HULL</div>
+      <h3>後台軌跡虛線範圍</h3>
+      <p>玩家移動軌跡儲存於後台，並於監控端以虛線自動勾勒出探索領域邊界。</p>
+    </div>
+    <div class="f-card">
+      <div class="f-num">04 / TARGET ID</div>
+      <h3>敵人特徵與紅濾鏡</h3>
+      <p>比對登入前拍攝的玩家樣貌與持機姿態，以白虛線框與淡紅濾鏡鎖定敵人。</p>
+    </div>
+  </div>
+
+  <div class="intro-footer">
+    <div class="room-panel">
+      <span>連機頻道 (ROOM ID)</span>
+      <input id="roomCode" type="text" value="AR-ROOM-1" placeholder="輸入房號">
+    </div>
+    <button id="start" class="go-btn" disabled>完成拍攝後登入空間系統 (LOG IN)</button>
+    <div style="display:flex;justify-content:center;gap:16px;"><a class="dash-link" href="dashboard.html" target="_blank">開啟伺服器即時地圖監控端 (Dashboard) ↗</a><a class="dash-link" href="trainer.html" target="_blank" style="color:#ffb86c;">開啟 AI 空間判讀訓練工作台 (Trainer) ↗</a></div>
+    <div id="err"></div>
+  </div>
+</div>
+
+<div id="panel">
+  <label>中央區基準 <input id="sSize" type="range" min="0.7" max="2" step="0.05"><output id="oSize"></output></label>
+  <label>相機視角 <input id="sFov" type="range" min="45" max="90" step="1"><output id="oFov"></output></label>
+  <label>步長（公尺）<input id="sStep" type="range" min="0.4" max="1" step="0.05"><output id="oStep"></output></label>
+  <label>點雲敏感度 <input id="sDot" type="range" min="4" max="40" step="1"><output id="oDot"></output></label>
+  <div class="row">
+    <button id="bHud" class="btn">資訊文字</button>
+    <button id="bClear" class="btn">清除虛擬建築</button>
+    <button id="bGen" class="btn">立即生成一處</button>
+    <button id="bScan" class="btn">重置掃描記憶</button>
+    <button id="bSus" class="btn">觸發懸疑</button>
+    <button id="bFree" class="btn">自由生成（測試用）</button>
+  </div>
+</div>
+
+<div id="bar" hidden>
+  <button id="bCal" class="btn">校準前方</button>
+  <button id="bLimit" class="btn on">視野限制</button>
+  <button id="bWalk" class="btn">按住前進</button>
+  <button id="bSet" class="btn">設定</button>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

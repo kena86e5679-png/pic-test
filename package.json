@@ -1,0 +1,13 @@
+{
+  "name": "ar-spatial-multiplayer",
+  "version": "5.0.0",
+  "description": "空間偏好 AR：1m網格陣列定位、軌跡範圍虛線勾勒、實心不透明建築生成與玩家照片特徵鎖定系統",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}
